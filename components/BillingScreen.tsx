@@ -717,57 +717,157 @@ const BillingScreen: React.FC<BillingScreenProps> = ({
     }
   };
 
+  // ── ESC/POS WiFi Thermal Printing ──────────────────────────────────────
+  const sendEscPosBill = async (order: Order, gst: number, vat: number): Promise<boolean> => {
+    const serverUrl = restaurantInfo.printServerUrl?.trim();
+    const printerIp = restaurantInfo.billPrinterIp?.trim();
+    if (!serverUrl || !printerIp) return false;
+
+    const foodItems = order.items.filter(it => {
+      const cat = categories.find(c => c.id === it.categoryId);
+      return cat?.type !== 'DRINK';
+    }).map(it => ({
+      name: it.name,
+      quantity: it.quantity,
+      price: it.price,
+      selectedPortion: it.selectedPortion,
+      selectedMl: it.selectedMl,
+    }));
+
+    const drinkItems = order.items.filter(it => {
+      const cat = categories.find(c => c.id === it.categoryId);
+      return cat?.type === 'DRINK';
+    }).map(it => ({
+      name: it.name,
+      quantity: it.quantity,
+      price: it.price,
+      selectedPortion: it.selectedPortion,
+      selectedMl: it.selectedMl,
+    }));
+
+    const billData = {
+      restaurantName: restaurantInfo.name,
+      restaurantAddress: restaurantInfo.address,
+      restaurantPhone: restaurantInfo.phone,
+      billNo: order.billNo,
+      tableName: order.tableName || '',
+      customerName: order.customerName || '',
+      date: order.date,
+      time: order.time,
+      orderType: order.orderType,
+      foodItems,
+      drinkItems,
+      subtotal: Math.round(order.subtotal),
+      gst: Math.round(gst),
+      gstPercent: Math.round(taxRate * 100),
+      vat: Math.round(vat),
+      vatPercent: Math.round(drinkTaxRate * 100),
+      tax: Math.round(order.tax),
+      discountPercent: order.discountPercent || 0,
+      discountAmount: Math.round(order.discountAmount || 0),
+      total: Math.round(order.total),
+      paymentMode: order.paymentMode,
+      gstNo: restaurantInfo.gstNo,
+      vatNo: restaurantInfo.vatNo,
+      fssaiNo: restaurantInfo.fssaiNo,
+    };
+
+    try {
+      const res = await fetch(`${serverUrl}/print-bill`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: billData, printerIp }),
+      });
+      const result = await res.json();
+      return result.ok === true;
+    } catch (err) {
+      console.warn('[ESC/POS] Bill print failed, falling back to browser print:', err);
+      return false;
+    }
+  };
+
+  const sendEscPosKot = async (selectedTable: Table | undefined, itemsToPrint?: CartItem[]): Promise<boolean> => {
+    const serverUrl = restaurantInfo.printServerUrl?.trim();
+    const printerIp = restaurantInfo.kotPrinterIp?.trim();
+    if (!serverUrl || !printerIp) return false;
+
+    const lines = buildKotPrintLines(selectedTable, itemsToPrint);
+
+    try {
+      const res = await fetch(`${serverUrl}/print-kot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lines, printerIp }),
+      });
+      const result = await res.json();
+      return result.ok === true;
+    } catch (err) {
+      console.warn('[ESC/POS] KOT print failed, falling back to browser print:', err);
+      return false;
+    }
+  };
+
   const printReceipt = async (order: Order) => {
     // Compute GST/VAT for this order using category tax types via shared utility and round them
     const orderTaxInfo = calculateOrderTax(order.items, categories, taxRate, drinkTaxRate);
     const roundedGst = Math.round(orderTaxInfo.gst);
     const roundedVat = Math.round(orderTaxInfo.vat);
 
-    doIframeReceiptPrint(order, roundedGst, roundedVat);
+    // Try ESC/POS thermal printer first, fall back to browser print
+    const escPosSuccess = await sendEscPosBill(order, roundedGst, roundedVat);
+    if (!escPosSuccess) {
+      doIframeReceiptPrint(order, roundedGst, roundedVat);
+    }
   };
 
   const printHtmlContent = (htmlContent: string) => {
+    // Clean up any previous print sections
     document.getElementById('print-section')?.remove();
     document.getElementById('print-section-style')?.remove();
 
+    // Physically hide the entire app - PWA standalone mode ignores @media print
+    const root = document.getElementById('root');
+    const originalRootDisplay = root?.style.display || '';
+    if (root) root.style.display = 'none';
+
+    // Hide all direct body children
+    const bodyChildren = Array.from(document.body.children) as HTMLElement[];
+    const originalDisplays = bodyChildren.map(el => el.style.display);
+    bodyChildren.forEach(el => { el.style.display = 'none'; });
+
+    // Create print section with receipt content
+    const printSection = document.createElement('div');
+    printSection.id = 'print-section';
+    printSection.style.cssText = 'position:absolute;left:0;top:0;width:100%;margin:0;padding:0;background:white;z-index:999999;';
+    printSection.innerHTML = htmlContent;
+    document.body.appendChild(printSection);
+
+    // Also add a style to ensure clean printing
     const printStyle = document.createElement('style');
     printStyle.id = 'print-section-style';
     printStyle.innerHTML = `
       @media print {
-        body > *:not(#print-section) {
-          display: none !important;
-        }
-        #print-section, #print-section * {
-          display: block !important;
-          visibility: visible !important;
-        }
-        #print-section {
-          position: absolute;
-          left: 0;
-          top: 0;
-          width: 100%;
-          margin: 0;
-          padding: 0;
-          background: white !important;
-        }
+        body { margin: 0 !important; padding: 0 !important; background: white !important; }
+        #print-section style, #print-section script { display: none !important; }
       }
+      #print-section style, #print-section script { display: none !important; }
     `;
     document.head.appendChild(printStyle);
 
-    const printSection = document.createElement('div');
-    printSection.id = 'print-section';
-    printSection.innerHTML = htmlContent;
-    document.body.appendChild(printSection);
-
+    // Give the browser a moment to reflow, then print
     setTimeout(() => {
       window.focus();
       window.print();
-      
+
+      // Restore everything after print dialog closes
       setTimeout(() => {
         printSection.remove();
         printStyle.remove();
-      }, 1000);
-    }, 150);
+        // Restore all body children visibility
+        bodyChildren.forEach((el, i) => { el.style.display = originalDisplays[i]; });
+        if (root) root.style.display = originalRootDisplay;
+      }, 500);
+    }, 200);
   };
 
   const doIframeReceiptPrint = (order: Order, orderGst: number, orderVat: number) => {
@@ -1050,7 +1150,11 @@ const BillingScreen: React.FC<BillingScreenProps> = ({
     }
 
     const selectedTable = tables.find(t => t.id === selectedTableId);
-    doIframeKotPrint(selectedTable, itemsToPrint);
+    // Try ESC/POS thermal printer first, fall back to browser print
+    const escPosSuccess = await sendEscPosKot(selectedTable, itemsToPrint);
+    if (!escPosSuccess) {
+      doIframeKotPrint(selectedTable, itemsToPrint);
+    }
 
     // Update printedQty to match quantity for all items in cart
     if (orderType === 'DINE_IN' && selectedTableId) {
@@ -1075,7 +1179,11 @@ const BillingScreen: React.FC<BillingScreenProps> = ({
       return;
     }
     const selectedTable = tables.find(t => t.id === selectedTableId);
-    doIframeKotPrint(selectedTable, currentCart);
+    // Try ESC/POS thermal printer first, fall back to browser print
+    const escPosSuccess = await sendEscPosKot(selectedTable, currentCart);
+    if (!escPosSuccess) {
+      doIframeKotPrint(selectedTable, currentCart);
+    }
 
     // Also update printedQty so subsequent printKOT doesn't double print
     if (orderType === 'DINE_IN' && selectedTableId) {

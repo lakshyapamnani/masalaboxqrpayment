@@ -1118,48 +1118,103 @@ const App: React.FC = () => {
     const discountAmount = totals.discountAmount;
     const total = totals.total;
 
+    // ── Try ESC/POS thermal printer first ──
+    const serverUrl = restaurantInfo.printServerUrl?.trim();
+    const printerIp = restaurantInfo.billPrinterIp?.trim();
+    if (serverUrl && printerIp) {
+      const drinkNamePattern = /drink|beverage|smoothie|juice|shake|coffee|tea|soda|cola|mocktail/i;
+      const isDrinkCat = (catId: string) => {
+        const cat = categories.find(c => String(c.id) === String(catId));
+        return cat ? (cat.type === 'DRINK' || (!cat.type && drinkNamePattern.test(cat.name || ''))) : false;
+      };
+
+      const billData = {
+        restaurantName: restaurantInfo.name,
+        restaurantAddress: restaurantInfo.address,
+        restaurantPhone: restaurantInfo.phone,
+        billNo: `INV-${billCounter + 1}`,
+        tableName,
+        customerName: customerName !== 'Guest' ? customerName : '',
+        date: new Date().toLocaleDateString(),
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        orderType: 'DINE_IN',
+        foodItems: items.filter(it => !isDrinkCat(it.categoryId)).map(it => ({
+          name: it.name, quantity: it.quantity, price: it.price,
+          selectedPortion: it.selectedPortion, selectedMl: it.selectedMl,
+        })),
+        drinkItems: items.filter(it => isDrinkCat(it.categoryId)).map(it => ({
+          name: it.name, quantity: it.quantity, price: it.price,
+          selectedPortion: it.selectedPortion, selectedMl: it.selectedMl,
+        })),
+        subtotal: Math.round(subtotal),
+        gst: Math.round(gstAmount),
+        gstPercent: Math.round(taxRate * 100),
+        vat: Math.round(vatAmount),
+        vatPercent: Math.round(drinkTaxRate * 100),
+        tax: Math.round(taxAmount),
+        discountPercent,
+        discountAmount: Math.round(discountAmount),
+        total: Math.round(total),
+        paymentMode: 'NOT PAID',
+        gstNo: restaurantInfo.gstNo,
+        vatNo: restaurantInfo.vatNo,
+        fssaiNo: restaurantInfo.fssaiNo,
+      };
+
+      try {
+        const res = await fetch(`${serverUrl}/print-bill`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: billData, printerIp }),
+        });
+        const result = await res.json();
+        if (result.ok === true) return; // ESC/POS print succeeded, no need for browser print
+      } catch (err) {
+        console.warn('[ESC/POS] Table bill print failed, falling back to browser print:', err);
+      }
+    }
+
+    // ── Fall back to browser print dialog ──
     const printHtmlContent = (htmlContent: string) => {
       document.getElementById('print-section')?.remove();
       document.getElementById('print-section-style')?.remove();
+
+      const root = document.getElementById('root');
+      const originalRootDisplay = root?.style.display || '';
+      if (root) root.style.display = 'none';
+
+      const bodyChildren = Array.from(document.body.children) as HTMLElement[];
+      const originalDisplays = bodyChildren.map(el => el.style.display);
+      bodyChildren.forEach(el => { el.style.display = 'none'; });
+
+      const printSection = document.createElement('div');
+      printSection.id = 'print-section';
+      printSection.style.cssText = 'position:absolute;left:0;top:0;width:100%;margin:0;padding:0;background:white;z-index:999999;';
+      printSection.innerHTML = htmlContent;
+      document.body.appendChild(printSection);
 
       const printStyle = document.createElement('style');
       printStyle.id = 'print-section-style';
       printStyle.innerHTML = `
         @media print {
-          body > *:not(#print-section) {
-            display: none !important;
-          }
-          #print-section, #print-section * {
-            display: block !important;
-            visibility: visible !important;
-          }
-          #print-section {
-            position: absolute;
-            left: 0;
-            top: 0;
-            width: 100%;
-            margin: 0;
-            padding: 0;
-            background: white !important;
-          }
+          body { margin: 0 !important; padding: 0 !important; background: white !important; }
+          #print-section style, #print-section script { display: none !important; }
         }
+        #print-section style, #print-section script { display: none !important; }
       `;
       document.head.appendChild(printStyle);
-
-      const printSection = document.createElement('div');
-      printSection.id = 'print-section';
-      printSection.innerHTML = htmlContent;
-      document.body.appendChild(printSection);
 
       setTimeout(() => {
         window.focus();
         window.print();
-        
+
         setTimeout(() => {
           printSection.remove();
           printStyle.remove();
-        }, 1000);
-      }, 150);
+          bodyChildren.forEach((el, i) => { el.style.display = originalDisplays[i]; });
+          if (root) root.style.display = originalRootDisplay;
+        }, 500);
+      }, 200);
     };
 
     const html = `
